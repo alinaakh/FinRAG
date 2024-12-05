@@ -230,7 +230,7 @@ class BaseTask:
         for q_id, query in tqdm(self.queries.items(), desc="Hybrid search", total=len(self.queries)):
             if (query_ids is not None) and (q_id not in query_ids): # only process the queries in query_ids
                 continue
-            
+            '''
             # step 1: first try full text search with keywords
             try:
                 keywords = self.keyword_extraction_expansion(query)
@@ -259,7 +259,7 @@ class BaseTask:
                 #retrieved_docs['score'] = alpha*retrieved_docs['score1'] + (1-alpha)*retrieved_docs['score2']
             else:
                 retrieved_docs = retrieved_docs_2.rename(columns={'doc_id': 'doc_id', 'score': 'score'})
-            
+            '''
             # step 2 hybrid search with original query after filtering out the docs that failed in step 1
             try:
                 retrieved_docs = (self.hybrid_retriever
