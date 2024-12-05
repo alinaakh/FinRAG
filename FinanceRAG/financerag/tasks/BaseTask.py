@@ -133,7 +133,7 @@ class BaseTask:
                 for doc in corpus
             }
 
-    def create_hybrid_retriever(self, mode: str = "overwrite", batch_size: int = 256):
+    def create_hybrid_retriever(self, mode: str = "overwrite", batch_size: int = 64):
         if (self.hybrid_retriever is None):
             logger.info("Creating hybrid search table")
             db = lancedb.connect("/tmp/.lancedb")
