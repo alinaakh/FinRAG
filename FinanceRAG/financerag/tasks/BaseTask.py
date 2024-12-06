@@ -134,44 +134,62 @@ class BaseTask:
                 for doc in corpus
             }
 
-    def create_hybrid_retriever(self, mode: str = "overwrite", batch_size: int = 64):
-        if self.hybrid_retriever is None:
-            logger.info("Creating hybrid search table")
-            db = lancedb.connect("/tmp/.lancedb")
-            self.hybrid_retriever = db.create_table(
-                "hybrid_search_table", schema=self.Schema, on_bad_vectors="drop", mode=mode
-            )
-    
-            # Function to determine find_id
-            def get_find_id(doc_id):
-                # Extract sequences of uppercase letters
-                uppercase_seq = ''.join([char for char in doc_id if char.isupper()])
-                return uppercase_seq if uppercase_seq else "random"
-    
-            # Prepare corpus list
-            corpus_list = list(self.corpus.items())
-            for i in trange(0, len(corpus_list), batch_size, desc="Adding corpus to hybrid search table"):
-                batch = corpus_list[i:i + batch_size]
-                try:
-                    self.hybrid_retriever.add(data=[
-                        {
-                            "doc_id": doc_id,
-                            "find_id": get_find_id(doc_id),  # Adjusted logic for clustering
-                            "title": doc_data["title"],
-                            "text": self._clean_text("; ".join(doc_data["title"].split('_')) + "\n" + doc_data["text"]),
-                        }
-                        for doc_id, doc_data in batch
-                    ], on_bad_vectors="drop")
-                    logger.info(f"Successfully added batch {i // batch_size + 1} of {len(corpus_list) // batch_size + 1}")
-                except Exception as batch_error:
-                    logger.error(f"Error adding batch {i // batch_size + 1}: {batch_error}")
-    
-            # Create full-text search index
+    def hybrid_retrieve_rerank(self, top_k: int = 100, query_ids: Optional[List[str]] = None, alpha: float = 0.3, **kwargs) -> Dict[str, Dict[str, float]]:
+        """
+        Hybrid search using both semantic and full text similarity.
+        
+        Args:
+            query_ids (Optional[List[str]], defaults to None):
+                The list of query IDs in eval set to process. If provided, only the queries in the list will be processed.
+            top_k (int, defaults to 100):
+                The number of top results to return.
+
+        Returns:
+            Dict[str, Dict[str, float]]:
+                A dictionary where the key is the query ID and the value is another dictionary mapping document IDs to their retrieval scores.
+        """
+        logger.info("Hybrid search with both semantic and full text similarity.")
+        if query_ids is None:
+            logger.info("Processing all queries.")
+        else:
+            logger.info(f"Processing given {len(query_ids)} queries.")
+
+        results = {}
+        
+        for q_id, query in tqdm(self.queries.items(), desc="Hybrid search", total=len(self.queries)):
+            if (query_ids is not None) and (q_id not in query_ids):  # Only process the queries in query_ids
+                continue
+            
+            # Step 1: Extract `find_id` for the query ID
+            find_id = self._get_find_id(q_id)  # Use similar logic to `create_hybrid_retriever` here
+            logger.info(f"Processing query {q_id} with find_id {find_id}")
+
+            # Step 2: Perform hybrid search using the query and `find_id`
             try:
-                self.hybrid_retriever.create_fts_index(['title', 'text'], replace=True)
-                logger.info("FTS index created successfully.")
-            except Exception as index_error:
-                logger
+                retrieved_docs = (self.hybrid_retriever
+                                .search(query=query, query_type='hybrid')
+                                .where(f"find_id = '{find_id}'", prefilter=True)
+                                .rerank(reranker=self.reranker)
+                                .limit(top_k)
+                                .to_pandas()
+                )
+            except Exception as e:
+                logger.warning(f"query {q_id} failed with hybrid search: {e}. Retrying with vector search only.")
+                retrieved_docs = (self.hybrid_retriever
+                                .search(query=query, query_type='vector')
+                                .rerank(reranker=self.reranker)
+                                .limit(top_k)
+                                .to_pandas()
+                )
+            
+            # Step 3: Handle retrieved documents and calculate scores
+            retrieved_docs.dropna(inplace=True)
+            _ = self._rename_score_column(retrieved_docs, "score")
+
+            retrieved_docs = retrieved_docs.sort_values(by='score', ascending=False).drop_duplicates(subset=['doc_id'], keep='first').reset_index(drop=True')
+            results[q_id] = {doc_id: score for doc_id, score in zip(retrieved_docs['doc_id'], retrieved_docs['score'])}
+
+        return results
 
 
 
@@ -222,106 +240,10 @@ class BaseTask:
             raise ValueError(f"No score column found in DataFrame columns: {df.columns}")
         return True
 
+    
 
 
-    def extract_cluster_key(doc_id: str) -> str:
-        """
-        Extracts the cluster key based on uppercase character sequences in the document ID.
-        If no uppercase characters exist, assigns the key 'random'.
-        Args:
-            doc_id (str): The document ID to process.
-        Returns:
-            str: The cluster key for the document.
-        """
-        match = re.findall(r'[A-Z]+', doc_id)
-        return ''.join(match) if match else 'random'
-    
-    
-    def hybrid_retrieve_rerank(self, top_k: int = 100, query_ids: Optional[List[str]] = None, alpha: float = 0.3, **kwargs) -> Dict[str, Dict[str, float]]:
-        """
-        Hybrid search using both semantic and full-text similarity with clustering based on document ID patterns.
-        Args:
-            top_k (int): Number of top results to return (default=100).
-            query_ids (Optional[List[str]]): Specific query IDs to process (default=None, processes all queries).
-            alpha (float): Weight for combining scores (default=0.3).
-        Returns:
-            Dict[str, Dict[str, float]]: Mapping of query IDs to document IDs and scores.
-        """
-        logger.info("Starting hybrid retrieval with reranking.")
-        
-        if query_ids is None:
-            logger.info("Processing all queries in the dataset.")
-        else:
-            logger.info(f"Processing a subset of {len(query_ids)} queries.")
-        
-        results = {}
-        for q_id, query in tqdm(self.queries.items(), desc="Hybrid search", total=len(self.queries)):
-            if query_ids and q_id not in query_ids:
-                continue
-            
-            # Step 1: Full-text search with keywords
-            try:
-                keywords = self.keyword_extraction_expansion(query)
-                query_kw = "; ".join(keywords)
-                retrieved_docs_1 = (
-                    self.hybrid_retriever
-                    .search(query=query_kw, query_type='fts')
-                    .rerank(reranker=self.reranker)
-                    .limit(top_k)
-                    .to_pandas()
-                )
-                retrieved_docs_1 = self._rename_score_column(retrieved_docs_1, "score")
-                logger.info(f"Full-text search successful for query {q_id}.")
-            except Exception as e:
-                logger.warning(f"Full-text search failed for query {q_id}: {e}")
-                retrieved_docs_1 = pandas.DataFrame()
-    
-            # Step 2: Hybrid or fallback vector search
-            try:
-                cluster_key = extract_cluster_key(q_id)
-                cluster_filter = f"find_id = '{cluster_key}'"
-                retrieved_docs_2 = (
-                    self.hybrid_retriever
-                    .search(query=query, query_type='hybrid')
-                    .where(cluster_filter, prefilter=True)
-                    .rerank(reranker=self.reranker)
-                    .limit(top_k)
-                    .to_pandas()
-                )
-                logger.info(f"Hybrid search successful for query {q_id}.")
-            except Exception as e:
-                logger.warning(f"Hybrid search failed for query {q_id}: {e}. Falling back to vector search.")
-                try:
-                    retrieved_docs_2 = (
-                        self.hybrid_retriever
-                        .search(query=query, query_type='vector')
-                        .rerank(reranker=self.reranker)
-                        .limit(top_k)
-                        .to_pandas()
-                    )
-                    logger.info(f"Vector search successful for query {q_id}.")
-                except Exception as vector_error:
-                    logger.error(f"Vector search also failed for query {q_id}: {vector_error}")
-                    continue
-            
-            retrieved_docs_2 = self._rename_score_column(retrieved_docs_2, "score")
-    
-            # Combine results from full-text and hybrid/vector search
-            if not retrieved_docs_1.empty:
-                combined_docs = pandas.concat([retrieved_docs_1, retrieved_docs_2], ignore_index=True)
-                combined_docs.drop_duplicates(subset=['doc_id'], keep='first', inplace=True)
-            else:
-                combined_docs = retrieved_docs_2
-    
-            # Final cleaning and sorting
-            combined_docs.dropna(inplace=True)
-            combined_docs.sort_values(by='score', ascending=False, inplace=True)
-            combined_docs.reset_index(drop=True, inplace=True)
-            
-            results[q_id] = {doc_id: score for doc_id, score in zip(combined_docs['doc_id'], combined_docs['score'])}
-    
-        logger.info(f"Hybrid retrieval completed for {len(results)} queries.")
-        return results
+
 
 
 
