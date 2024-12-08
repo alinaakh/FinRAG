@@ -210,74 +210,82 @@ class BaseTask:
             raise ValueError(f"No score column found in DataFrame columns: {df.columns}")
         return True
 
-    def hybrid_retrieve_rerank(self, top_k=100, query_ids=None, alpha=0.3, **kwargs) -> Dict[str, Dict[str, float]]:
-        logger.info("Starting hybrid search with semantic and full-text similarity.")
-        if query_ids:
-            logger.info(f"Processing {len(query_ids)} specified queries.")
-        else:
+    def hybrid_retrieve_rerank(self, top_k: int = 100, query_ids: Optional[List[str]] = None, alpha: float = 0.3, **kwargs) -> Dict[str, Dict[str, float]]:
+        """
+        Hybrid search using both semantic and full text similarity.
+        Args:
+            query (str):
+                The query to search for.
+            top_k (int, defaults to 100):
+                The number of top results to return.
+            query_ids (Optional[List[str]], defaults to None):
+                The list of query IDs in eval set to process. If provided, only the queries in the list will be processed.
+        Returns:
+            Dict[str, Dict[str, float]]:
+                A dictionary where the key is the query ID and the value is another dictionary mapping document IDs to their retrieval scores.
+        """
+        logger.info("Hybrid search with both semantic and full text similarity.")
+        if query_ids is None:
             logger.info("Processing all queries.")
-    
+        else:
+            logger.info(f"Processing given {len(query_ids)} queries.")
+
         results = {}
-    
         for q_id, query in tqdm(self.queries.items(), desc="Hybrid search", total=len(self.queries)):
-            if query_ids and q_id not in query_ids:
+            if (query_ids is not None) and (q_id not in query_ids): # only process the queries in query_ids
                 continue
-    
-            retrieved_docs_1 = pandas.DataFrame()  # Default empty DataFrame for FTS results
-            
-            # Step 1: Full-text search
+            '''
+            # step 1: first try full text search with keywords
             try:
                 keywords = self.keyword_extraction_expansion(query)
                 query_kw = "; ".join(keywords)
-                retrieved_docs_1 = (
-                    self.hybrid_retriever
-                    .search(query=query_kw, query_type='fts')
-                    .rerank(reranker=self.reranker)
-                    .limit(top_k)
-                    .to_pandas()
+                retrieved_docs_1 = (self.hybrid_retriever
+                                    .search(query=query_kw, query_type='fts')
+                                    .rerank(reranker=self.reranker)
+                                    .limit(top_k)
+                                    .to_pandas()
                 )
-                _ = self._rename_score_column(retrieved_docs_1, "score")
-                logger.info(f"FTS successful for query ID {q_id}. Retrieved {len(retrieved_docs_1)} documents.")
             except Exception as e:
-                logger.warning(f"FTS failed for query ID {q_id}: {e}")
+                #retrieved_docs_1 = self.hybrid_retriever.search(query=query_kw, query_type='fts').limit(top_k).to_pandas()
+                retrieved_docs_1 = pandas.DataFrame()
+            _ = self._rename_score_column(retrieved_docs_1, "score")
             
-            # Step 2: Hybrid or fallback vector search
+            
+            # the intersection of retrieved_docs_1 and retrieved_docs_2
+            if len(retrieved_docs_1) > 0:
+          
+                retrieved_docs = pandas.concat([retrieved_docs_1, retrieved_docs_2], ignore_index=True)
+                #retrieved_docs = pandas.DataFrame(columns=['doc_id', 'score1','score2','score'])
+                #filtered_doc_ids = set(retrieved_docs_1['doc_id']).intersection(set(retrieved_docs_2['doc_id']))
+                #retrieved_docs['doc_id'] = list(filtered_doc_ids)
+                #retrieved_docs['score1'] = retrieved_docs.doc_id.apply(lambda x: retrieved_docs_1[retrieved_docs_1['doc_id']==x]['score'].values[0])
+                #retrieved_docs['score2'] = retrieved_docs.doc_id.apply(lambda x: retrieved_docs_2[retrieved_docs_2['doc_id']==x]['score'].values[0])
+                #retrieved_docs['score'] = alpha*retrieved_docs['score1'] + (1-alpha)*retrieved_docs['score2']
+            else:
+                retrieved_docs = retrieved_docs_2.rename(columns={'doc_id': 'doc_id', 'score': 'score'})
+            '''
+            # step 2 hybrid search with original query after filtering out the docs that failed in step 1
             try:
-                retrieved_docs = (
-                    self.hybrid_retriever
-                    .search(query=query, query_type='hybrid')
-                    .rerank(reranker=self.reranker)
-                    .limit(top_k)
-                    .to_pandas()
-                )
-            except Exception as e:
-                logger.warning(f"Hybrid search failed for query ID {q_id}: {e}. Retrying with vector search.")
-                try:
-                    retrieved_docs = (
-                        self.hybrid_retriever
-                        .search(query=query, query_type='vector')
-                        .rerank(reranker=self.reranker)
-                        .limit(top_k)
-                        .to_pandas()
+                retrieved_docs = (self.hybrid_retriever
+                            .search(query=query, query_type='hybrid')
+                            .rerank(reranker=self.reranker)
+                            .limit(top_k)
+                            .to_pandas()
                     )
-                except Exception as vector_error:
-                    logger.error(f"Vector search also failed for query ID {q_id}: {vector_error}")
-                    results[q_id] = {}  # No documents retrieved
-                    continue
-            
-            # Combine results if FTS was successful
-            if not retrieved_docs_1.empty:
-                retrieved_docs = pandas.concat([retrieved_docs_1, retrieved_docs], ignore_index=True)
-                retrieved_docs.drop_duplicates(subset=['doc_id'], keep='first', inplace=True)
-    
-            # Clean up and finalize results
+            except Exception as e:
+                #logger.warning(f"query {q_id} failed with hybrid search: {e}. Retrying with vector search only.")
+                retrieved_docs = (self.hybrid_retriever
+                                .search(query=query, query_type='vector')
+                                .rerank(reranker=self.reranker)
+                                .limit(top_k)
+                                .to_pandas()
+                    )
             retrieved_docs.dropna(inplace=True)
             _ = self._rename_score_column(retrieved_docs, "score")
-            retrieved_docs = retrieved_docs.sort_values(by='score', ascending=False).reset_index(drop=True)
-    
+
+            retrieved_docs = retrieved_docs.sort_values(by='score', ascending=False).drop_duplicates(subset=['doc_id'], keep='first').reset_index(drop=True)
             results[q_id] = {doc_id: score for doc_id, score in zip(retrieved_docs['doc_id'], retrieved_docs['score'])}
-            logger.info(f"Query ID {q_id} retrieved {len(results[q_id])} documents.")
-    
+            
         return results
 
 
